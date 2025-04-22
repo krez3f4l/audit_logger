@@ -1,0 +1,8 @@
+env: "local"
+
+grpc_server:
+  port: 9000
+
+db_conn:
+  uri: "mongodb://localhost:27017"
+  database: "audit_db"

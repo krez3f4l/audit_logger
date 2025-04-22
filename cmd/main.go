@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"go.mongodb.org/mongo-driver/mongo"
@@ -15,20 +18,29 @@ import (
 	"github.com/krez3f4l/audit_logger/internal/service"
 )
 
+const (
+	timeoutPing = 3 * time.Second
+)
+
+var (
+	configDir  = os.Getenv("AUDIT_CONFIG_DIR")
+	configName = os.Getenv("AUDIT_CONFIG_NAME")
+)
+
 func main() {
-	cfg, err := config.New()
+	cfg, err := config.NewConfig(configDir, configName)
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutPing)
 	defer cancel()
 
-	opts := options.Client()
+	opts := options.Client().ApplyURI(cfg.DBConn.URI)
 	opts.SetAuth(options.Credential{
-		Username: cfg.DB.Username,
-		Password: cfg.DB.Password,
+		Username: cfg.DBConn.Username,
+		Password: cfg.DBConn.Password,
 	})
 
 	client, err := mongo.Connect(ctx, opts)
@@ -36,20 +48,39 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := client.Ping(context.Background(), nil); err != nil {
+	if err = client.Ping(context.Background(), nil); err != nil {
 		log.Fatal(err)
 	}
 
-	db := client.Database(cfg.DB.Database)
+	db := client.Database(cfg.DBConn.Database)
 
 	auditRepo := repository.NewAudit(db)
 	auditService := service.NewService(auditRepo)
 	auditSrv := server.NewAuditServer(auditService)
 	srv := server.NewServer(auditSrv)
 
-	fmt.Println("SERVER STARTED", time.Now())
+	shutdownChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
 
-	if err := srv.ListenAndServe(cfg.Server.Port); err != nil {
-		log.Fatal(err)
+	go func() {
+		if err = srv.ListenAndServe(cfg.Server.Port); err != nil {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	fmt.Println("gRPC audit server started", time.Now())
+
+	<-shutdownChan
+	fmt.Println("Shutting down server")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeoutPing)
+	defer shutdownCancel()
+
+	srv.GracefulStop()
+
+	if err = client.Disconnect(shutdownCtx); err != nil {
+		log.Printf("Mongo disconnect error: %v", err)
 	}
+
+	fmt.Println("Audit server stopped")
 }
